@@ -1,12 +1,13 @@
 """
-gemini_test.py — Routed RAG for WhatsApp (Meta Cloud API) + Gemini
+main.py — Routed RAG Chatbot for WhatsApp (Meta Cloud API) + Gemini
 
-Key improvements vs current version:
-- Intent routing (funding / investing / academy / premium / paises / onboarding / general)
+Architecture:
+- Intent routing (funding / investing / academy / premium / onboarding / general)
 - Separate FAISS index per topic (retrieval only from relevant sources)
-- Per-intent prompts (prevents unwanted academy/premium segways)
+- Per-intent prompts (prevents topic bleed)
 - Hard limits: TRANSCRIPT_MAX_CHUNKS + TRANSCRIPT_LOAD_TIMEOUT_SEC
-- Safer WhatsApp formatting
+- Conversation logging to SQLite + Google Sheets
+- Deduplication of incoming WhatsApp messages (retries)
 """
 
 import os
@@ -14,7 +15,7 @@ import json
 import logging
 import datetime
 import time
-logging.info("BOOT CHECK: gemini_test_v1 loaded, time=%s", time.time())
+logging.info("BOOT CHECK: main loaded, time=%s", time.time())
 from typing import List, Dict, Tuple, Optional, Any, Set
 
 import numpy as np
@@ -82,7 +83,7 @@ SEEN_MESSAGE_IDS: set[str] = set()
 SEEN_MAX = int(os.getenv("SEEN_MAX", "5000"))
 
 def pick_faiss_dir() -> str:
-    # If you add a Render Disk later, you can point FAISS_DIR to it via env var.
+    # If you add a persistent disk (e.g., Render Disk), set FAISS_DIR env var to point to it.
     preferred = os.getenv("FAISS_DIR", "/var/data/faiss")
 
     try:
@@ -93,7 +94,6 @@ def pick_faiss_dir() -> str:
         os.remove(testfile)
         return preferred
     except Exception:
-        # Always writable on Render, but not persistent across deploys
         fallback = "/tmp/faiss"
         os.makedirs(fallback, exist_ok=True)
         return fallback
@@ -112,8 +112,7 @@ gemini_model = None
 if GEMINI_API_KEY:
     try:
         genai_client = genai.Client(api_key=GEMINI_API_KEY)
-        # For text generation:
-        gemini_model = GEMINI_MODEL  # keep as a string; e.g. "gemini-1.5-flash"
+        gemini_model = GEMINI_MODEL
         logging.info("Gemini client ready (model=%s)", GEMINI_MODEL)
     except Exception:
         logging.exception("Failed to initialize Gemini (google-genai)")
@@ -123,45 +122,34 @@ else:
 # -----------------------------
 # Transcript sources
 # Each tuple: (relative_or_abs_path, topic_name)
-# IMPORTANT: topic_name is used for routing filters.
+# topic_name is used for intent routing and FAISS index lookup.
+#
+# Add your own PDF knowledge base files here.
+# Organize by topic to enable per-topic retrieval.
 # -----------------------------
-TRANSCRIPT_PDF_PATH     = os.getenv("TRANSCRIPT_PDF_PATH", "")    # fondeo luis fernando
-TRANSCRIPT_PDF_PATH_3   = os.getenv("TRANSCRIPT_PDF_PATH_3", "")  # fondeo av
-TRANSCRIPT_PDF_PATH_4   = os.getenv("TRANSCRIPT_PDF_PATH_4", "")  # insights av
-TRANSCRIPT_PDF_PATH_5   = os.getenv("TRANSCRIPT_PDF_PATH_5", "")  # productos av
-TRANSCRIPT_PDF_PATH_6   = os.getenv("TRANSCRIPT_PDF_PATH_6", "")  # productos lista
-TRANSCRIPT_PDF_PATH_7   = os.getenv("TRANSCRIPT_PDF_PATH_7", "")  # academy isa
-TRANSCRIPT_PDF_PATH_8   = os.getenv("TRANSCRIPT_PDF_PATH_8", "")  # academy lista
-TRANSCRIPT_PDF_PATH_9   = os.getenv("TRANSCRIPT_PDF_PATH_9", "")  # premium isa
-TRANSCRIPT_PDF_PATH_10   = os.getenv("TRANSCRIPT_PDF_PATH_10", "")  # home isa
-TRANSCRIPT_PDF_PATH_13   = os.getenv("TRANSCRIPT_PDF_PATH_13", "")  # onboarding av
-TRANSCRIPT_PDF_PATH_14   = os.getenv("TRANSCRIPT_PDF_PATH_14", "")  # paises av
-TRANSCRIPT_PDF_PATH_15   = os.getenv("TRANSCRIPT_PDF_PATH_15", "")  # fondeos_ach av
-
 TRANSCRIPT_SOURCES: List[Tuple[str, str]] = [
-    # Onboarding
-    ("transcripts/onboarding av.pdf", "onboarding"),
-    
-    # Funding
-    ("transcripts/fondeos luisf.pdf", "fondeo"),
-    ("transcripts/fondeos av.pdf", "fondeo"),
-    ("transcripts/fondeos_ach av.pdf", "fondeo"),
-    
-    # Investing
-    ("transcripts/productos av.pdf", "productos"),
-    ("transcripts/productos lista.pdf", "productos"),
-    
-    # Academy 
-    ("transcripts/academy isa.pdf", "academy"),
-    ("transcripts/academy lista.pdf", "academy"),
-    
-    # Premium
-    ("transcripts/premium isa.pdf", "premium"),
-    
-    #General
-    ("transcripts/insights av.pdf", "insights"),
-    ("transcripts/home isa.pdf", "home"),
-    ("transcripts/paises av.pdf", "paises"),
+    # Onboarding / account opening
+    ("docs/onboarding.pdf", "onboarding"),
+
+    # Funding / deposits / withdrawals
+    ("docs/funding_faq.pdf", "funding"),
+    ("docs/funding_ach.pdf", "funding"),
+
+    # Investment products
+    ("docs/products_overview.pdf", "products"),
+    ("docs/products_catalog.pdf", "products"),
+
+    # Education / academy
+    ("docs/academy_overview.pdf", "academy"),
+    ("docs/academy_catalog.pdf", "academy"),
+
+    # Premium / advisor tier
+    ("docs/premium_overview.pdf", "premium"),
+
+    # General platform info
+    ("docs/platform_overview.pdf", "general"),
+    ("docs/home_faq.pdf", "general"),
+    ("docs/supported_countries.pdf", "countries"),
 ]
 
 # -----------------------------
@@ -215,8 +203,8 @@ def log_message(
 
 def get_recent_history(wa_id: str, limit: int = 8) -> str:
     """
-    Returns the last `limit` messages for this user in a simple transcript format.
-    Uses your existing SQLAlchemy model: Message(wa_id, direction, text, created_at).
+    Returns the last `limit` messages for this user as a simple transcript string.
+    Used for conversation continuity in the prompt.
     """
     try:
         db = SessionLocal()
@@ -231,7 +219,7 @@ def get_recent_history(wa_id: str, limit: int = 8) -> str:
 
         lines = []
         for r in rows:
-            role = "Usuario" if r.direction == "user" else "Asistente"
+            role = "User" if r.direction == "user" else "Assistant"
             lines.append(f"{role}: {r.text}")
 
         return "\n".join(lines).strip()
@@ -248,7 +236,7 @@ def get_recent_history(wa_id: str, limit: int = 8) -> str:
 # In-memory indexes (per topic)
 # -----------------------------
 TOPIC_CHUNKS: Dict[str, List[Dict[str, str]]] = {}   # topic -> [{"text","source"}, ...]
-TOPIC_INDEX: dict[str, faiss.Index] = {}                    # topic -> faiss index
+TOPIC_INDEX: dict[str, faiss.Index] = {}              # topic -> faiss index
 TOPIC_DIM: Optional[int] = None
 
 # -----------------------------
@@ -263,7 +251,7 @@ def _abs_path(p: str) -> str:
 
 def chunk_text(text: str, min_chars: int, max_chars: int, overlap: int) -> List[str]:
     """
-    Chunk by paragraphs with overlap, aiming for stable retrieval.
+    Split text into overlapping chunks by paragraph, aiming for stable retrieval quality.
     """
     raw = (text or "").strip()
     if not raw:
@@ -279,7 +267,6 @@ def chunk_text(text: str, min_chars: int, max_chars: int, overlap: int) -> List[
             if len(buf) >= min_chars:
                 chunks.append(buf)
             else:
-                # force append even if small (avoid losing info)
                 if buf:
                     chunks.append(buf)
             buf = p
@@ -303,7 +290,7 @@ def chunk_text(text: str, min_chars: int, max_chars: int, overlap: int) -> List[
 
 def read_pdf_text(path: str) -> str:
     """
-    PDF -> text (best effort).
+    Extract text from a PDF file.
     """
     try:
         import pypdf
@@ -320,10 +307,8 @@ def read_pdf_text(path: str) -> str:
 
 def embed_texts_gemini(texts: List[str]) -> np.ndarray:
     """
-    Embed multiple documents for retrieval (google-genai).
-    Robust to missing client / transient API errors.
-    Returns float32 array of shape (n_texts, dim) when successful,
-    or (0, 0) when nothing could be embedded.
+    Embed a list of text chunks using the Gemini embedding model.
+    Returns float32 array of shape (n_texts, dim), or (0, 0) on failure.
     """
     if not texts:
         return np.zeros((0, 0), dtype="float32")
@@ -374,58 +359,74 @@ def embed_query_gemini(q: str) -> np.ndarray:
     return vec.reshape(1, -1)
 
 # -----------------------------
-# Intent Routing (the “training” lever)
+# Intent Routing
+# Classify user message into a topic to route retrieval to the right FAISS index.
+# Extend keyword lists to match your platform's terminology.
 # -----------------------------
 def classify_intent(user_text: str) -> str:
     """
-    Returns one of: funding | investing | academy | premium | general
+    Returns one of: funding | investing | academy | premium | onboarding | countries | general
     """
     t = (user_text or "").lower().strip()
 
     # Funding / deposits / withdrawals
     if any(k in t for k in [
-        "deposit", "depósito", "deposito", "fonde", "fondeo", "recargar",
-        "retirar", "retiro", "withdraw", "withdrawal"
+        "deposit", "withdrawal", "withdraw", "transfer", "fund", "wire",
+        "ach", "bank account", "add money", "cash out"
     ]):
         return "funding"
 
-    # Academy / learning
+    # Education / academy
     if any(k in t for k in [
-        "academy", "curso", "cursos", "clase", "clases", "aprender",
-        "educación", "educacion"
+        "academy", "course", "courses", "class", "learn", "education", "tutorial"
     ]):
         return "academy"
 
     # Premium / advisor
     if any(k in t for k in [
-        "premium", "asesor", "asesoría", "asesoria", "llamada", "advisor", "wealth", "suscripción", "anual", "mensual", "planes"
+        "premium", "advisor", "advisory", "call", "wealth", "subscription",
+        "annual", "monthly", "plan", "plans"
     ]):
         return "premium"
 
-    # Investing basics
+    # Investing / products
     if any(k in t for k in [
-        "invert", "inversión", "inversion", "etf", "acciones", "bonos",
-        "portafolio", "riesgo", "diversific", "diversificación", "diversificacion"
+        "invest", "portfolio", "etf", "stocks", "bonds", "risk",
+        "diversif", "returns", "allocation", "asset"
     ]):
         return "investing"
-    
-    # Onboarding
+
+    # Account opening / onboarding
     if any(k in t for k in [
-        "abrir cuenta", "cuenta abierta", "cedula", "pasaporte", "identificación", "proof of address", "comprobante de domicilio", "PPT", "permiso de proteccion temporal", "cedula de extranjeria"
+        "open account", "account opening", "sign up", "register", "id", "passport",
+        "identity", "proof of address", "kyc", "verification", "documents"
     ]):
-        return "cuenta abierta"
+        return "onboarding"
+
+    # Country availability
+    if any(k in t for k in [
+        "country", "countries", "available in", "residence", "region"
+    ]):
+        return "countries"
+
+    # Support / escalation
+    if any(k in t for k in [
+        "help", "support", "human", "agent", "not working", "issue", "problem",
+        "complaint", "contact"
+    ]):
+        return "support"
 
     return "general"
 
-# Map intent → transcript topic labels
+# Map intent → transcript topic labels (must match TRANSCRIPT_SOURCES topic names)
 TOPIC_MAP = {
-    "funding": "fondeo",
-    "investing": "productos",
+    "funding": "funding",
+    "investing": "products",
     "academy": "academy",
     "premium": "premium",
-    "general": "insights",  # or "home"
-    "cuenta abierta": "onboarding",
-    "country": "paises",
+    "general": "general",
+    "onboarding": "onboarding",
+    "countries": "countries",
 }
 
 def retrieve_context_by_topic(query: str, topic: str, k: int):
@@ -433,7 +434,7 @@ def retrieve_context_by_topic(query: str, topic: str, k: int):
     return retrieve_context(query, topic=mapped_topic, k=k)
 
 # -----------------------------
-# Build per-topic FAISS indices (with limits)
+# Build per-topic FAISS indices
 # -----------------------------
 def load_chunks_cache(path: str):
     if not os.path.exists(path):
@@ -531,7 +532,6 @@ def build_transcript_indexes() -> None:
         TOPIC_CHUNKS, TOPIC_INDEX, TOPIC_DIM = {}, {}, None
         return
 
-    # Build each topic index
     TOPIC_CHUNKS = {}
     TOPIC_INDEX = {}
     TOPIC_DIM = None
@@ -558,10 +558,11 @@ def build_transcript_indexes() -> None:
 
         logging.info("Index ready topic=%s chunks=%d dim=%d", topic, len(docs), dim)
 
-RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.25"))  # ajusta luego con pruebas
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.25"))
 
 def retrieve_context(query: str, topic: str, k: int):
     """
+    Retrieve the top-k relevant chunks for a query from the specified topic index.
     Returns: (context_str, best_score)
     """
     if TRANSCRIPT_DISABLE_RAG:
@@ -579,7 +580,7 @@ def retrieve_context(query: str, topic: str, k: int):
     faiss.normalize_L2(qvec)
     D, I = idx.search(qvec, k)
 
-    # FAISS IndexFlatIP con vectores normalizados => score ~ cosine similarity
+    # IndexFlatIP with normalized vectors → cosine similarity scores
     best_score = float(D[0][0]) if D is not None and len(D) and len(D[0]) else 0.0
 
     picked = []
@@ -592,136 +593,63 @@ def retrieve_context(query: str, topic: str, k: int):
     return "\n\n---\n\n".join(picked).strip(), best_score
 
 # -----------------------------
-# Prompts (per intent)
+# System Prompt
+# Customize for your platform's tone, rules, and product scope.
 # -----------------------------
-BASE_GUARDRAILS = """
-Eres asesorIA de Insights.
-
-Jerarquía de conocimiento (OBLIGATORIA):
-1) Estas reglas del sistema (SYSTEM RULES / BASE GUARDRAILS) tienen máxima prioridad.
-2) Luego, usa como fuente principal la información interna provista en el contexto (transcripts/FAQ internos recuperados por RAG).
-3) Solo si NO hay información relevante en los transcripts/FAQ internos, puedes usar conocimiento general para responder.
-
-Reglas generales:
-- Responde en español claro y accionable.
-- Educación general: NO des recomendaciones personalizadas ni “lo mejor para ti”.
-- NO recomiendes tickers específicos.
-- Si falta un dato clave para dar pasos concretos (ej: país, método de depósito, etc.), pide SOLO 1 pregunta corta.
-- NO promociones Academy/Premium a menos que el usuario pregunte por educación/asesoría o sea un follow-up natural y relevante.
-"""
-
 SYSTEM_RULES = """
-Eres consultorIA de Insights.
+You are an AI assistant for an investment platform.
 
-Misión:
-- Ayudar a usuarios con dudas sobre: depósitos/retiros, uso de la app, conceptos generales de inversión y productos de Insights.
+Mission:
+- Help users with questions about: deposits/withdrawals, app usage, general investment concepts, and platform products.
 
-Jerarquía de fuentes (OBLIGATORIA):
-- Prioridad 1: Reglas de este sistema (cumplimiento, tono, límites).
-- Prioridad 2: Información interna provista en el contexto (transcripts/FAQ internos del onboarding y otros materiales internos). Esta es la fuente principal de conocimiento.
-- Prioridad 3: Conocimiento general SOLO si el contexto interno no contiene información relevante o suficiente.
+Source hierarchy (MANDATORY):
+- Priority 1: These system rules (compliance, tone, limits).
+- Priority 2: Internal context provided in the prompt (retrieved from platform docs via RAG). This is the primary knowledge source.
+- Priority 3: General knowledge ONLY if the internal context does not contain relevant information.
 
-Reglas de uso de transcripts (RAG-first):
-- Siempre asume que la respuesta puede estar en los transcripts y prioriza buscar/usar esa información.
-- Si el contexto interno incluye información relevante, responde basándote en esa información y NO completes con suposiciones de conocimiento general.
-- Si NO hay información relevante en el contexto interno:
-  - Puedes responder con conocimiento general, pero aclara de forma breve que es una explicación general y puede variar según políticas internas.
-  - Si falta un dato clave para poder responder o para recuperar mejor información (por ejemplo país, tipo de cuenta, método), haz SOLO 1 pregunta corta.
+RAG-first policy:
+- Always assume the answer may be in the retrieved docs. Prioritize using that information.
+- If the internal context contains relevant information, respond based on it. Do NOT supplement with general assumptions.
+- If NO relevant context is found:
+  - You may respond with general knowledge, but briefly note it is a general explanation that may vary by platform policy.
+  - If a key piece of information is missing (e.g. country, account type), ask ONLY 1 short clarifying question.
 
-Reglas de respuesta:
-- Responde en español claro, directo y accionable.
-- Responde de forma conversacional, como una persona por WhatsApp (no como un manual).
-- Explica bien, pero sin hacer la respuesta larga o densa.
+Response rules:
+- Respond clearly, directly, and conversationally — as if messaging someone on WhatsApp.
+- Keep responses concise: 6-10 lines max. No long blocks of text.
+- Use bullet points ("•") when listing steps or options.
+- Avoid formal phrases like "It is important to note that..." or "Allow me to explain..."
 
-ESTILO Y LONGITUD (MUY IMPORTANTE):
-- Máximo 6-10 líneas de texto total.
-- Evita párrafos largos o explicaciones innecesarias.
-- No respondas ni demasiado corto ni demasiado largo.
-- Es importante que respondas las preguntas con claridad y detalle, sin necesidad de ser muy largo.  
+Tone:
+- Friendly, helpful, and approachable.
 
-TONO:
-- Natural, cercano y útil.
-- Evita frases formales como:
-  "A continuación te explico..." o "Es importante destacar que..."
-  
-  FLUJO IDEAL:
-1. 1 frase corta y natural
-2. Explicación clara (bullets o frases)
-3. 1 pregunta corta para continuar la conversación
-
-Reglas adicionales:
-- Educación general: NO des recomendaciones personalizadas ni “lo mejor para ti”.
-- NO recomiendes tickers, acciones específicas, o portafolios concretos.
-- Prioriza responder la pregunta del usuario. No cambies de tema.
-- NO menciones Academy a menos que:
-  (a) el usuario lo pregunte explícitamente, o
-  (b) sea un siguiente paso natural.
-- Puedes mencionar Premium solo si es natural en la conversación y de forma breve.
-- Si falta un dato clave para dar pasos concretos, haz SOLO 1 pregunta corta.
-- Si detectas frustración (ej. "no funciona", "estoy harto", "no entiendo nada"), 
-  pide disculpas y ofrece el link del centro de ayuda: https://help.insightswm.com/hc/es-419
-- Si el usuario pide explícitamente hablar con un humano o soporte técnico, indícale que puede encontrar todas las opciones de contacto en nuestro centro de ayuda: https://help.insightswm.com/hc/es-419
-  
-Formato WhatsApp:
-- Usa bullets “•” cuando tenga sentido.
-- Párrafos cortos.
-- Evita bloques de texto largos.
+Compliance rules:
+- Do NOT give personalized financial advice or say "the best option for you is..."
+- Do NOT recommend specific tickers, stocks, or individual securities.
+- Prioritize answering the user's actual question. Don't change the subject.
+- Only mention premium/advisor tier if the user asks, or if it is a genuinely natural next step.
+- If the user expresses frustration or asks for a human agent, empathize and point them to the help center: YOUR_HELP_CENTER_URL
 """.strip()
-
-def classify_intent(user_text: str) -> str:
-    t = (user_text or "").lower()
-    if any(k in t for k in ["deposit", "depósito", "deposito", "fonde", "fondeo", "retirar", "retiro", "withdraw"]):
-        return "funding"
-    if any(k in t for k in ["academy", "curso", "cursos", "clase", "aprender", "educación", "educacion"]):
-        return "academy"
-    if any(k in t for k in ["premium", "asesor", "asesoría", "asesoria", "llamada", "advisor", "suscripción", "anual", "mensual", "planes"]):
-        return "premium"
-    if any(k in t for k in ["invert", "inversión", "inversion", "acciones", "bonos", "etf", "portafolio", "riesgo", "diversific", "efectivo rentable", "money market", "single stocks", "acciones y ETFs", "portafolio gestionado", "managed portfolio", "portafolio temático", "themed portfolio", "portafolio IA", "AI portfolio", "portafolio BlackRock", "Crypto", "Cash"]):
-        return "investing"
-    if any(k in t for k in ["onboarding", "abrir cuenta", "apertura", "crear cuenta", "documentos", "documento", "identificación", "identificacion", "cédula", "cedula", "ine", "dni", "licencia", "id", "pasaporte", "proof of address", "comporbante de domicilio", "PPT", "permiso de protección temporal", "cedula de extranjería"]):
-        return "onboarding"
-    if any(k in t for k in ["pais", "paises", "residencia"]):
-        return "paises"
-    if any(k in t for k in [
-        "ayuda adicional", "hablar con alguien", "soporte", "humano", "agente", "no entiendo", "no me ayudas", "estoy frustrado", "queja", "reclamo","centro de ayuda", "link de ayuda", "servicio al cliente"
-    ]):
-        return "ayuda_externa"
-    return "general"
 
 def mode_instruction(intent: str) -> str:
     if intent == "funding":
-        return "Modo: FONDEO/RETIROS. Da pasos dentro de la app, tiempos, comisiones si aplica. Checklist + 1 pregunta si falta algo."
+        return "Mode: FUNDING. Explain deposit/withdrawal steps, timing, fees if applicable. Use a checklist format. Ask 1 question if a key detail is missing."
     if intent == "investing":
-        return "Modo: CÓMO INVERTIR. Explica el proceso general + pasos en la app + los productos que tenemos en el app. Sin recomendaciones específicas."
+        return "Mode: INVESTING. Explain the general investment process and available products. No specific ticker recommendations."
     if intent == "academy":
-        return "Modo: ACADEMY. Explica qué es, cómo acceder y qué incluye."
+        return "Mode: ACADEMY. Explain what educational content is available, how to access it, and what it covers."
     if intent == "premium":
-        return "Modo: PREMIUM. Explica qué incluye, cómo funciona, cuanto cuesta, y cómo solicitarlo. No des todo el detalle en un solo mensaje."
+        return "Mode: PREMIUM. Explain what the premium tier includes, how it works, pricing, and how to sign up. Don't dump all details in one message."
     if intent == "onboarding":
-        return "Modo: ONBOARDING. Da pasos dentro de la app, documentos que necesitan y preguntas que tengan."
-    if intent == "paises":
-        return "Modo: PAISES. Da los paises en los que Insights está disponible."
-    if intent == "ayuda_externa":
+        return "Mode: ONBOARDING. Walk through account opening steps, required documents, and common questions."
+    if intent == "countries":
+        return "Mode: COUNTRIES. Explain which countries/regions the platform supports."
+    if intent == "support":
         return (
-            "Modo: SOPORTE EXTERNO. El usuario parece frustrado o necesita ayuda que no puedes proveer. "
-            "Debes ser empático, pedir disculpas si es necesario y proporcionar OBLIGATORIAMENTE "
-            "el link al centro de ayuda: https://help.insightswm.com/hc/es-419"
+            "Mode: SUPPORT ESCALATION. The user seems frustrated or needs help beyond your scope. "
+            "Be empathetic and provide the help center link: YOUR_HELP_CENTER_URL"
         )
-    return "Modo: GENERAL. Resuelve la duda y guía al siguiente paso."
-
-def build_prompt(user_text: str, intent: str, context: str) -> str:
-    return f"""
-{SYSTEM_RULES}
-
-{mode_instruction(intent)}
-
-Contexto interno (úsalo solo si es relevante):
-{context if context else "(sin contexto recuperado)"}
-
-Usuario: {user_text}
-
-Respuesta:
-""".strip()
+    return "Mode: GENERAL. Answer the question and guide the user to the next logical step."
 
 def _sanitize_for_whatsapp(text: str) -> str:
     if not text:
@@ -736,7 +664,6 @@ def _sanitize_for_whatsapp(text: str) -> str:
 # -----------------------------
 import base64
 
-# Accept both env var naming conventions
 GSHEET_ID = (
     os.getenv("GSHEET_ID", "").strip()
     or os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -760,13 +687,6 @@ def _load_creds_dict():
     if GOOGLE_CREDS_JSON_B64:
         decoded = base64.b64decode(GOOGLE_CREDS_JSON_B64).decode("utf-8")
         return json.loads(decoded)
-
-    if GOOGLE_CREDS_FILE:
-        path = GOOGLE_CREDS_FILE
-        if not os.path.isabs(path):
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     return None
 
@@ -828,9 +748,6 @@ def log_to_sheet(wa_id: str, direction: str, text: str, message_id: str = ""):
         logging.exception("Failed to append row to Google Sheet.")
 
 def log_loaded_transcripts():
-    """
-    Logs how many chunks were loaded per topic. Safe if indexes aren't built.
-    """
     try:
         if not TOPIC_CHUNKS:
             logging.warning("No transcript chunks loaded (TOPIC_CHUNKS empty).")
@@ -852,17 +769,16 @@ def log_loaded_transcripts():
 def generate_reply(user_text: str, wa_id: str):
     try:
         if genai_client is None or not gemini_model:
-            return "¡Hola! 😊 Soy consultorIA de Insights. ¿En qué te puedo ayudar hoy?", {}
+            return "Hi! I'm your investment assistant. How can I help you today?", {}
 
         user_text = (user_text or "").strip()
         if not user_text:
-            return "¿Qué te gustaría hacer hoy: depositar, retirar o invertir?", {"intent": "empty"}
+            return "What would you like to do today — deposit, withdraw, or invest?", {"intent": "empty"}
 
-        # 1) Route intent (new)
+        # 1) Route intent
         intent = classify_intent(user_text)
 
-        # 2) Retrieve transcript context (RAG) — topic-limited (new)
-        # NOTE: implement retrieve_context_by_topic(...) using your existing retrieval + filtered chunks/index
+        # 2) Retrieve topic-filtered RAG context
         context, best_score = retrieve_context_by_topic(user_text, topic=intent, k=TRANSCRIPT_TOP_K)
         has_rag = bool(context) and (best_score >= RAG_MIN_SCORE)
 
@@ -871,48 +787,47 @@ def generate_reply(user_text: str, wa_id: str):
             intent, has_rag, best_score, len(context or "")
         )
 
-        # 3) Retrieve recent chat history (keep your existing function)
+        # 3) Retrieve recent conversation history
         history = get_recent_history(wa_id, limit=8)
 
-        # 4) One-line “mode” steering (no PROMPTS dict)
+        # 4) Mode-specific steering instruction
         mode = mode_instruction(intent)
 
-        # 5) Use transcripts as primary source of truth
+        # 5) RAG source policy
         if has_rag:
             rag_policy = (
-                "POLÍTICA DE FUENTES: Usa como fuente principal el Contexto interno (transcripts). "
-                "Si el contexto interno contiene información relevante, NO completes con suposiciones de conocimiento general."
+                "SOURCE POLICY: Use the internal context (retrieved docs) as the primary source. "
+                "If the internal context contains relevant information, do NOT supplement with general assumptions."
             )
         else:
             rag_policy = (
-                "POLÍTICA DE FUENTES: No se encontró contexto interno relevante para esta pregunta. "
-                "Puedes responder con conocimiento general, y si falta un dato clave haz SOLO 1 pregunta corta."
+                "SOURCE POLICY: No relevant internal context was found for this question. "
+                "You may respond with general knowledge. If a key detail is missing, ask ONLY 1 short question."
             )
 
-        # 6) Build the prompt (still SYSTEM_RULES)
+        # 6) Build the prompt
         prompt = f"""
 {SYSTEM_RULES}
 
 {rag_policy}
 {mode}
 
-Historial reciente (útil para continuidad):
-{history if history else "(sin historial)"}
+Recent conversation history (for continuity):
+{history if history else "(no history)"}
 
-Contexto interno (transcripts recuperados):
-{context if has_rag else "(sin contexto interno relevante)"}
+Internal context (retrieved docs):
+{context if has_rag else "(no relevant internal context)"}
 
-Usuario: {user_text}
-Asistente:
+User: {user_text}
+Assistant:
 """.strip()
 
         # 7) Call Gemini
         response = genai_client.models.generate_content(
-            model=gemini_model,   # aquí gemini_model ES un string tipo "gemini-1.5-flash"
+            model=gemini_model,
             contents=prompt,
         )
 
-        # Extraer texto de forma robusta
         reply_text = (getattr(response, "text", "") or "").strip()
         if not reply_text:
             try:
@@ -922,7 +837,7 @@ Asistente:
             except Exception:
                 reply_text = ""
 
-        # 8) WhatsApp formatting cleanup (use your existing helper)
+        # 8) WhatsApp formatting cleanup
         reply_text = _sanitize_for_whatsapp(reply_text)
 
         return reply_text, {
@@ -933,7 +848,7 @@ Asistente:
 
     except Exception:
         logging.exception("generate_reply failed")
-        return "Tuve un problema generando la respuesta. ¿Puedes intentar de nuevo?", {"error": "generate_reply_failed"}
+        return "I had trouble generating a response. Please try again.", {"error": "generate_reply_failed"}
 
 # -----------------------------
 # WhatsApp send helpers
@@ -967,14 +882,12 @@ def send_whatsapp_text(to_number: str, message: str, phone_number_id: Optional[s
 def send_whatsapp_template(
     to_number: str,
     template_name: str,
-    language_code: str = "es",
+    language_code: str = "en",
     phone_number_id: Optional[str] = None,
     components: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Send a WhatsApp template message.
-    Log it immediately after sending (recommended) because webhook won't always
-    include the full outbound template content.
     """
     sender_phone_id = phone_number_id or os.getenv("WHATSAPP_PHONE_ID")
     token = os.getenv("WHATSAPP_TOKEN")
@@ -1033,7 +946,7 @@ def send_whatsapp_template(
 app = FastAPI()
 
 # Meta may retry deliveries; dedup prevents double replies.
-# NOTE: This is in-memory (resets on deploy). For production use Redis/DB with TTL.
+# NOTE: This is in-memory (resets on deploy). For production, use Redis/DB with TTL.
 SEEN_MESSAGE_IDS: Set[str] = set()
 
 import asyncio
@@ -1041,8 +954,6 @@ from collections import defaultdict
 
 USER_LOCKS = defaultdict(asyncio.Lock)
 
-# If true, ignore webhook events that are not for WHATSAPP_PHONE_ID.
-# For debugging, keep this False (so you don’t accidentally ignore all events).
 ENFORCE_PHONE_ID = os.getenv("ENFORCE_PHONE_ID", "false").lower() == "true"
 
 @app.on_event("startup")
@@ -1051,7 +962,7 @@ async def startup_event():
 
     os.makedirs(FAISS_DIR, exist_ok=True)
 
-    # Load caches
+    # Try to load cached indexes first (faster startup)
     TOPIC_INDEX = load_faiss_cache(FAISS_DIR) or {}
     TOPIC_CHUNKS = load_chunks_cache(CHUNKS_PATH) or {}
 
@@ -1062,10 +973,9 @@ async def startup_event():
         logging.info("Application startup complete.")
         return
 
-    logging.info("FAISS cache/chunks missing → attempting to build transcript indexes...")
+    logging.info("FAISS cache missing → building transcript indexes from source PDFs...")
 
     try:
-        # IMPORTANT: don't let this crash startup
         build_transcript_indexes()
     except Exception:
         logging.exception("Transcript index build failed; starting WITHOUT RAG.")
@@ -1074,7 +984,6 @@ async def startup_event():
         logging.info("Application startup complete (RAG disabled due to build failure).")
         return
 
-    # Only save if we actually built something
     if TOPIC_INDEX and TOPIC_CHUNKS:
         save_faiss_cache(TOPIC_INDEX, FAISS_DIR)
         save_chunks_cache(TOPIC_CHUNKS, CHUNKS_PATH)
@@ -1094,7 +1003,7 @@ async def head_root():
     return Response(status_code=200)
 
 # -----------------------------
-# Webhook verification (GET)
+# Debug endpoints
 # -----------------------------
 @app.get("/debug/sheets-test")
 async def sheets_test():
@@ -1103,7 +1012,7 @@ async def sheets_test():
         return {"ok": False, "error": "get_sheet() returned None. Check logs for the reason."}
 
     try:
-        ws.append_row([datetime.datetime.utcnow().isoformat(), "debug", "debug", "debug", "hello from render"], value_input_option="RAW")
+        ws.append_row([datetime.datetime.utcnow().isoformat(), "debug", "debug", "debug", "test row"], value_input_option="RAW")
         return {"ok": True, "tab": GSHEET_TAB}
     except Exception as e:
         logging.exception("sheets-test append failed")
@@ -1112,21 +1021,22 @@ async def sheets_test():
 @app.get("/debug/rag-stats")
 async def rag_stats():
     return {
-        "chunks_loaded": len(CHUNKS),
-        "index_ready": INDEX is not None,
-        "embed_dim": EMBED_DIM,
+        "topics_loaded": list(TOPIC_CHUNKS.keys()),
+        "chunks_per_topic": {t: len(c) for t, c in TOPIC_CHUNKS.items()},
+        "index_ready": bool(TOPIC_INDEX),
         "top_k": TRANSCRIPT_TOP_K,
         "rag_disabled": TRANSCRIPT_DISABLE_RAG,
     }
 
+# -----------------------------
+# Webhook verification (GET)
+# -----------------------------
 @app.get("/webhook")
 async def verify_token(
     hub_mode: str = Query("", alias="hub.mode"),
     hub_challenge: str = Query("", alias="hub.challenge"),
     hub_verify_token: str = Query("", alias="hub.verify_token"),
 ):
-    # WhatsApp verification:
-    # ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return PlainTextResponse(hub_challenge)
     raise HTTPException(status_code=403, detail="Verification failed")
@@ -1134,37 +1044,28 @@ async def verify_token(
 def extract_user_text(message: Dict[str, Any]) -> Optional[str]:
     """
     Normalize inbound WhatsApp message into a single user_text string.
-
-    Supports:
-    - text
-    - button (older quick reply format)
-    - interactive (button_reply, list_reply)  ✅ template buttons land here
-    - media captions (image/video/document)
+    Supports: text, button, interactive (button_reply, list_reply), media captions.
     """
     if not message:
         return None
 
     mtype = (message.get("type") or "").strip()
 
-    # Normal text
     if mtype == "text":
         text = ((message.get("text") or {}).get("body") or "").strip()
         return text or None
 
-    # Quick reply buttons (older format)
     if mtype == "button":
         btn = message.get("button") or {}
         text = (btn.get("payload") or btn.get("text") or "").strip()
         return text or None
 
-    # Interactive replies (common for template buttons + list replies)
     if mtype == "interactive":
         inter = message.get("interactive") or {}
         itype = (inter.get("type") or "").strip()
 
         if itype == "button_reply":
             br = inter.get("button_reply") or {}
-            # Prefer id for deterministic routing; fall back to title
             val = (br.get("id") or br.get("title") or "").strip()
             return val or None
 
@@ -1173,10 +1074,8 @@ def extract_user_text(message: Dict[str, Any]) -> Optional[str]:
             val = (lr.get("id") or lr.get("title") or "").strip()
             return val or None
 
-        # If Meta changes structure, at least return something non-empty
         return str(inter).strip() or None
 
-    # Media with captions
     if mtype in {"image", "video", "document"}:
         caption = ((message.get(mtype) or {}).get("caption") or "").strip()
         return caption or f"[{mtype}]"
@@ -1193,7 +1092,6 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
             for change in changes:
                 value = change.get("value") or {}
 
-                # ---- Metadata (which phone number received the message) ----
                 metadata = value.get("metadata") or {}
                 display_phone = metadata.get("display_phone_number")
                 meta_phone_number_id = metadata.get("phone_number_id")
@@ -1205,9 +1103,7 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
                     phone_number_id,
                 )
 
-                # ============================================================
-                # 1) INBOUND USER MESSAGES
-                # ============================================================
+                # ---- Inbound user messages ----
                 messages = value.get("messages") or []
                 contacts = value.get("contacts") or []
 
@@ -1227,11 +1123,10 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
                         user_text,
                     )
 
-                    # Skip unsupported payloads (reactions, media without caption, etc.)
                     if not from_wa or not user_text:
                         continue
 
-                    # ---- DEDUPLICATION (Meta retries webhooks) ----
+                    # ---- Deduplication (Meta retries webhooks) ----
                     if user_msg_id:
                         async with SEEN_LOCK:
                             if user_msg_id in SEEN_MESSAGE_IDS:
@@ -1240,53 +1135,30 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
 
                             SEEN_MESSAGE_IDS.add(user_msg_id)
 
-                            # prevent unbounded memory growth
                             if len(SEEN_MESSAGE_IDS) > SEEN_MAX:
                                 SEEN_MESSAGE_IDS.clear()
 
-                    # ---- PER-USER ORDERING (avoid overlapping replies) ----
+                    # ---- Per-user ordering (avoid overlapping replies) ----
                     async with USER_LOCKS[from_wa]:
 
-                        # Log inbound message to DB
                         try:
-                            log_message(
-                                wa_id=from_wa,
-                                direction="user",
-                                text=user_text,
-                            )
+                            log_message(wa_id=from_wa, direction="user", text=user_text)
                         except Exception:
                             logging.exception("Failed to log user message to DB")
 
-                        # Log inbound message to Google Sheets
                         try:
-                            log_to_sheet(
-                                wa_id=from_wa,
-                                direction="user",
-                                message_id=user_msg_id,
-                                text=user_text,
-                            )
+                            log_to_sheet(wa_id=from_wa, direction="user", message_id=user_msg_id, text=user_text)
                         except Exception:
                             logging.exception("Failed to log user message to Sheet")
 
-                        # ---- Generate reply ----
-                        reply_text, _meta = generate_reply(
-                            user_text=user_text,
-                            wa_id=from_wa,
-                        )
+                        reply_text, _meta = generate_reply(user_text=user_text, wa_id=from_wa)
 
-                        if not phone_number_id:
-                            logging.warning(
-                                "Missing phone_number_id; using default sender."
-                            )
-
-                        # ---- Send reply ----
                         resp = send_whatsapp_text(
-                        to_number=from_wa,
-                        message=reply_text,
-                        phone_number_id=phone_number_id,
+                            to_number=from_wa,
+                            message=reply_text,
+                            phone_number_id=phone_number_id,
                         )
 
-                        # Capture bot message id if available
                         bot_msg_id = None
                         try:
                             if isinstance(resp, dict):
@@ -1294,30 +1166,17 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
                         except Exception:
                             bot_msg_id = None
 
-                        # Log bot reply to DB
                         try:
-                            log_message(
-                                wa_id=from_wa,
-                                direction="bot",
-                                text=reply_text,
-                            )
+                            log_message(wa_id=from_wa, direction="bot", text=reply_text)
                         except Exception:
                             logging.exception("Failed to log bot message to DB")
 
-                        # Log bot reply to Sheets
                         try:
-                            log_to_sheet(
-                                wa_id=from_wa,
-                                direction="bot",
-                                message_id=bot_msg_id or user_msg_id,
-                                text=reply_text,
-                            )
+                            log_to_sheet(wa_id=from_wa, direction="bot", message_id=bot_msg_id or user_msg_id, text=reply_text)
                         except Exception:
                             logging.exception("Failed to log bot message to Sheet")
 
-                # ============================================================
-                # 2) STATUS UPDATES (delivered, read, etc.)
-                # ============================================================
+                # ---- Status updates (delivered, read, etc.) ----
                 statuses = value.get("statuses") or []
                 if statuses and not messages:
                     logging.info(
@@ -1329,7 +1188,7 @@ async def process_webhook_payload(payload: dict, inbound_phone_number_id: str | 
         logging.exception("process_webhook_payload failed")
 
 # -----------------------------
-# Webhook receiver (POST) — UPDATED
+# Webhook receiver (POST)
 # -----------------------------
 from fastapi import Body
 
@@ -1337,7 +1196,7 @@ from fastapi import Body
 async def admin_send_template(payload: dict = Body(...)):
     wa_id = (payload.get("wa_id") or "").strip()
     template_name = (payload.get("name") or "").strip()
-    lang = (payload.get("lang") or "es").strip()
+    lang = (payload.get("lang") or "en").strip()
     vars_obj = payload.get("vars") or {}
 
     if not wa_id:
@@ -1345,20 +1204,15 @@ async def admin_send_template(payload: dict = Body(...)):
     if not template_name:
         return JSONResponse({"ok": False, "error": "Missing template name"}, status_code=400)
 
-    # Build template components
     components = None
     if vars_obj:
-        # If keys are digits ("1","2") treat as positional; otherwise treat as named vars
         keys = list(vars_obj.keys())
         all_digits = all(str(k).isdigit() for k in keys)
 
         if all_digits:
-            # Order positional params 1,2,3...
             ordered_items = sorted(((int(k), vars_obj[k]) for k in keys), key=lambda x: x[0])
             parameters = [{"type": "text", "text": str(v)} for _, v in ordered_items]
         else:
-            # Named variables: Meta expects parameter_name
-            # Keep stable ordering (sorted by key)
             ordered_items = sorted(((str(k), vars_obj[k]) for k in keys), key=lambda x: x[0])
             parameters = [
                 {"type": "text", "parameter_name": k, "text": str(v)}
@@ -1380,12 +1234,7 @@ async def admin_send_template(payload: dict = Body(...)):
     except Exception:
         pass
 
-    log_to_sheet(
-        wa_id=wa_id,
-        direction="bot",
-        message_id=out_id,
-        text=f"[TEMPLATE SENT] {template_name}",
-    )
+    log_to_sheet(wa_id=wa_id, direction="bot", message_id=out_id, text=f"[TEMPLATE SENT] {template_name}")
 
     return {"ok": True, "resp": resp, "message_id": out_id}
 
@@ -1394,12 +1243,11 @@ async def admin_send_template(payload: dict = Body(...)):
 async def whatsapp_webhook(request: Request):
     """
     WhatsApp Cloud API webhook.
-    ACK immediately, then process asynchronously to avoid timeouts.
+    ACKs immediately, then processes asynchronously to avoid gateway timeouts.
     """
     payload = await request.json()
     logging.info("Incoming webhook keys=%s", list(payload.keys()))
 
-    # Extract inbound phone_number_id (which WA number received this message)
     inbound_phone_number_id = None
     try:
         value = (
@@ -1424,10 +1272,8 @@ async def whatsapp_webhook(request: Request):
     except Exception:
         logging.exception("Failed to parse/log webhook metadata")
 
-    # Fire-and-forget async processing
     asyncio.create_task(process_webhook_payload(payload, inbound_phone_number_id))
 
-    # ACK fast
     return JSONResponse({"status": "ok"}, status_code=200)
 
 # -----------------------------
@@ -1439,7 +1285,7 @@ async def test_api(req: Request):
     q = (data.get("q") or "").strip()
     if not q:
         return JSONResponse({"error": "Missing q"}, status_code=400)
-    reply_text, meta = generate_reply(q)
+    reply_text, meta = generate_reply(q, wa_id="test_user")
     return {"reply": reply_text, "meta": meta}
 
 
@@ -1447,19 +1293,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-
-
-# Sending template message manually
-# curl -X POST "https://consultoria-3.onrender.com/admin/send-template" \
-#  -H "Content-Type: application/json" \
-#  -d '{"wa_id":"573206720800","name":"bienvenida_insights","lang":"es"}'
-
-# Steps to run:
-# 1. open terminal
-# 2. Input into terminal: cd /Users/manuelalozano/Documents/INSIGHTS/proyecto\ ia
-# 3. Input into terminal: source .venv/bin/activate
-# 4. Input into terminal: python test_environment.py
-
-# To exit environment when finished: enter into terminal: deactivate
