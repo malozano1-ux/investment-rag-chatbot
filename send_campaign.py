@@ -1,3 +1,11 @@
+# send_campaign.py
+# Bulk WhatsApp template message sender.
+# Reads recipients from a CSV file and sends a template message to each,
+# with rate limiting to stay within Meta's API limits.
+#
+# Required CSV columns: wa_id, customer_name
+# Required env vars: BOT_BASE_URL, TPL_NAME, TPL_LANG (see .env.example)
+
 import os
 import sys
 import time
@@ -7,13 +15,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.getenv("BOT_BASE_URL", "https://consultoria-4.onrender.com").rstrip("/")
+BASE_URL = os.getenv("BOT_BASE_URL", "https://your-deployment-url.com").rstrip("/")
 ENDPOINT = "/admin/send-template"
 
-TEMPLATE_NAME = (os.getenv("TPL_ACCOUNT_OPENED") or "mensaje_efectivo_rentable").strip()
-LANG = (os.getenv("TPL_LANG") or "es_CO").strip()
+TEMPLATE_NAME = (os.getenv("TPL_NAME") or "your_template_name").strip()
+LANG = (os.getenv("TPL_LANG") or "en").strip()
 
-CSV_PATH = os.getenv("CASH_CSV", "cash.csv")
+CSV_PATH = os.getenv("CAMPAIGN_CSV", "contacts.csv")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 DELAY_BETWEEN_BATCHES = float(os.getenv("DELAY_BETWEEN_BATCHES", "5"))
 DELAY_BETWEEN_MESSAGES = float(os.getenv("DELAY_BETWEEN_MESSAGES", "0.5"))
@@ -33,7 +41,7 @@ def load_contacts(path: str):
             if not wa_id:
                 continue
             if not name:
-                name = "hola"
+                name = "there"
             contacts.append({"wa_id": wa_id, "customer_name": name})
     return contacts
 
