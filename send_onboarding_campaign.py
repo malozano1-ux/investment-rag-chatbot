@@ -1,3 +1,11 @@
+# send_onboarding_campaign.py
+# Send a WhatsApp onboarding template message to a list of new users.
+# Reads recipients from a CSV file (wa_id, customer_name).
+#
+# Typically used to re-engage users who started but did not complete account opening.
+#
+# Required env vars: BOT_BASE_URL, TPL_ONBOARDING, TPL_LANG (see .env.example)
+
 import os
 import sys
 import time
@@ -7,13 +15,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.getenv("BOT_BASE_URL", "https://consultoria-4.onrender.com").rstrip("/")
+BASE_URL = os.getenv("BOT_BASE_URL", "https://your-deployment-url.com").rstrip("/")
 ENDPOINT = "/admin/send-template"
 
-TEMPLATE_NAME = (os.getenv("TPL_ONBOARDING_STALLED") or "mensaje_onboarding").strip()
-LANG = (os.getenv("TPL_LANG") or "es_CO").strip()
+TEMPLATE_NAME = (os.getenv("TPL_ONBOARDING") or "onboarding_reminder").strip()
+LANG = (os.getenv("TPL_LANG") or "en").strip()
 
-CSV_PATH = os.getenv("ONBOARDING_CSV", "onboarding.csv")
+CSV_PATH = os.getenv("ONBOARDING_CSV", "onboarding_contacts.csv")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 DELAY_BETWEEN_BATCHES = float(os.getenv("DELAY_BETWEEN_BATCHES", "5"))
 DELAY_BETWEEN_MESSAGES = float(os.getenv("DELAY_BETWEEN_MESSAGES", "0.5"))
@@ -33,7 +41,7 @@ def load_contacts(path: str):
             if not wa_id:
                 continue
             if not name:
-                name = "hola"
+                name = "there"
             contacts.append({"wa_id": wa_id, "customer_name": name})
     return contacts
 
